@@ -8,6 +8,7 @@ package org.h2.test.store;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -27,6 +28,8 @@ import org.h2.mvstore.MVStore;
 import org.h2.mvstore.MVStoreException;
 import org.h2.mvstore.OffHeapStore;
 import org.h2.mvstore.RandomAccessStore;
+import org.h2.mvstore.SFChunk;
+import org.h2.mvstore.SingleFileStore;
 import org.h2.mvstore.type.DataType;
 import org.h2.mvstore.type.MetaType;
 import org.h2.mvstore.type.ObjectDataType;
@@ -113,6 +116,7 @@ public class TestMVStore extends TestBase {
         testCompactMapNotOpen();
         testReuseSpace();
         testDeadChunkKeptForRetentionTime();
+        testCloseSyncBeforeChunkReuse();
         testRandom();
         testKeyValueClasses();
         testIterate();
@@ -1974,6 +1978,44 @@ public class TestMVStore extends TestBase {
             s.commit();
             assertFalse(s.getLayoutMap().containsKey(chunk1));
         }
+    }
+
+    private void testCloseSyncBeforeChunkReuse() {
+        String fileName = getBaseDir() + "/" + getTestName();
+        FileUtils.delete(fileName);
+        int chunkStart = 2 * 4096;
+        AtomicReference<ByteBuffer> oldChunk = new AtomicReference<>();
+        SingleFileStore fileStore = new SingleFileStore(new HashMap<>()) {
+            @Override
+            public void sync() {
+                ByteBuffer expected = oldChunk.getAndSet(null);
+                if (expected != null) {
+                    // The last synced chunk must survive until its replacement is synced.
+                    assertEquals(expected, readFully((SFChunk) null, chunkStart, expected.remaining()));
+                }
+                super.sync();
+            }
+        };
+        fileStore.open(fileName, false, (char[]) null);
+        try (MVStore s = new MVStore.Builder().adoptFileStore(fileStore).autoCommitDisabled().open()) {
+            s.setVersionsToKeep(0);
+            s.setRetentionTime(Integer.MAX_VALUE);
+            MVMap<Integer, String> map = s.openMap("data");
+            for (int i = 0; i < 100; i++) {
+                map.put(i, "old" + i);
+            }
+            s.commit();
+            s.sync();
+            ByteBuffer chunk = fileStore.readFully(null, chunkStart, (int) fileStore.size() - chunkStart);
+            for (int i = 0; i < 100; i++) {
+                map.put(i, "new" + i);
+            }
+            s.openMap("other").put(1, "x");
+            s.commit();
+            map.put(0, "last");
+            oldChunk.set(chunk);
+        }
+        assertNull(oldChunk.get());
     }
 
     private void testRandom() {
